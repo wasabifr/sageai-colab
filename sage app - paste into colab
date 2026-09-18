@@ -2,10 +2,10 @@
 # Runtime → Change runtime type → T4/L4/A100. Pascal (CC>=6.0)+ use CUDA; older → CPU.
 !pip install -q -U "gradio>=6.0.0" transformers accelerate bitsandbytes ddgs sentencepiece protobuf
 
-import os, re, json, traceback, threading, warnings
+import os, re, json, gc, traceback, threading, warnings
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Iterator, Any
 
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -65,50 +65,180 @@ def detect_gpu() -> dict:
 
 GPU = detect_gpu()
 print("GPU:", GPU["note"])
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct" if GPU["use_gpu"] else "Qwen/Qwen2.5-1.5B-Instruct"
 
-# ── model load (cached) ──────────────────────────────────────────────────────
-print(f"Loading {MODEL_ID}  cache={CACHE_DIR}")
-tok = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_DIR, trust_remote_code=True)
-if tok.pad_token is None:
-    tok.pad_token = tok.eos_token
-tok.padding_side = "left"
+# Ungated models that work well in Colab. 7B+ is auto-quantized on T4.
+MODELS = {
+    "NeoHorse 1.0": "TokenRhythm/NeoHorse-1-9B",
+    "Qwen 3 8B":   "Qwen/Qwen3-8B",
+    "Qwen2.5 Coder 7B":      "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "SmolLM2 1.7B Instruct": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+}
+DEFAULT_MODEL_NAME = "Qwen2.5-3B-Instruct" if GPU["use_gpu"] else "Qwen2.5-1.5B-Instruct"
+MODEL_ID = MODELS[DEFAULT_MODEL_NAME]
 
-load_kw = dict(cache_dir=CACHE_DIR, trust_remote_code=True, low_cpu_mem_usage=True)
-if GPU["use_gpu"]:
-    load_kw["attn_implementation"] = "sdpa"  # flash-attn2 needs Ampere+; Pascal/Turing → SDPA
-    if GPU["use_4bit"]:
-        load_kw["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-    else:
-        load_kw["torch_dtype"] = torch.float16
-    load_kw["device_map"] = "auto"
-else:
-    load_kw["torch_dtype"] = torch.float32
-    load_kw["device_map"] = "cpu"
+FALLBACK_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+)
 
-try:
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **load_kw)
-except Exception as e:
-    if "quantization_config" not in load_kw:
-        raise
-    print(f"4-bit load failed ({type(e).__name__}: {e}) → fp16 fallback")
-    load_kw.pop("quantization_config", None)
-    load_kw["torch_dtype"] = torch.float16
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **load_kw)
-
-model.eval()
-DEVICE = next(model.parameters()).device
+model = tok = None
+DEVICE = torch.device("cpu")
 GEN_LOCK = threading.Lock()
-print(f"Ready on {DEVICE}  params={sum(p.numel() for p in model.parameters())/1e6:.0f}M")
+
+def _needs_4bit(model_id: str) -> bool:
+    if not GPU["use_gpu"] or GPU["cc_float"] < BNB_CC_MIN:
+        return False
+    if FORCE_4BIT or GPU["vram_gb"] < 8:
+        return True
+    big = any(tag in model_id.upper() for tag in ("7B", "8B", "9B", "13B", "14B"))
+    return big and GPU["vram_gb"] < 20
+
+def unload_model():
+    global model, tok
+    try:
+        del model
+    except Exception:
+        pass
+    try:
+        del tok
+    except Exception:
+        pass
+    model = tok = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+def load_llm(model_id: str, hf_token: str = "") -> str:
+    """Load (or reload) a causal LM. Returns a status line."""
+    global model, tok, DEVICE, MODEL_ID
+    model_id = (model_id or "").strip()
+    if not model_id:
+        return "No model id."
+    token = (hf_token or os.environ.get("HF_TOKEN") or "").strip() or None
+    if token:
+        os.environ["HF_TOKEN"] = token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+
+    with GEN_LOCK:
+        unload_model()
+        print(f"Loading {model_id}  cache={CACHE_DIR}")
+        tok = AutoTokenizer.from_pretrained(
+            model_id, cache_dir=CACHE_DIR, trust_remote_code=True, token=token,
+        )
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token or tok.unk_token or "</s>"
+        tok.padding_side = "left"
+        if not getattr(tok, "chat_template", None):
+            tok.chat_template = FALLBACK_CHAT_TEMPLATE
+
+        use_4bit = _needs_4bit(model_id)
+        load_kw = dict(
+            cache_dir=CACHE_DIR, trust_remote_code=True,
+            low_cpu_mem_usage=True, token=token,
+        )
+        if GPU["use_gpu"]:
+            load_kw["attn_implementation"] = "sdpa"
+            if use_4bit:
+                load_kw["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+            else:
+                load_kw["torch_dtype"] = torch.float16
+            load_kw["device_map"] = "auto"
+        else:
+            load_kw["torch_dtype"] = torch.float32
+            load_kw["device_map"] = "cpu"
+
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kw)
+        except Exception as e:
+            if "quantization_config" not in load_kw:
+                raise
+            print(f"4-bit load failed ({type(e).__name__}: {e}) → fp16 fallback")
+            load_kw.pop("quantization_config", None)
+            load_kw["torch_dtype"] = torch.float16
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kw)
+
+        model.eval()
+        if getattr(model, "generation_config", None) is not None:
+            model.generation_config.pad_token_id = tok.pad_token_id
+            model.generation_config.eos_token_id = tok.eos_token_id
+        DEVICE = next(model.parameters()).device
+        MODEL_ID = model_id
+        n_m = sum(p.numel() for p in model.parameters()) / 1e6
+        q = "4-bit" if getattr(model, "is_loaded_in_4bit", False) else str(DEVICE)
+        note = f"Ready  **{model_id}**  ·  {n_m:.0f}M  ·  {q}  ·  {GPU['note']}"
+        print(note)
+        return note
+
+status_line = load_llm(MODEL_ID)
+
+# ── Gradio 6 content can be str | list[blocks] | ChatMessage ─────────────────
+def _content_to_str(c: Any) -> str:
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for part in c:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                t = getattr(part, "text", None)
+                parts.append(t if isinstance(t, str) else (str(part) if part is not None else ""))
+        return "\n".join(p for p in parts if p)
+    if isinstance(c, dict):
+        return str(c.get("text") or c.get("content") or "")
+    t = getattr(c, "text", None)
+    return t if isinstance(t, str) else str(c)
+
+def _msg_role(m: Any) -> str:
+    if isinstance(m, dict):
+        return str(m.get("role") or "")
+    return str(getattr(m, "role", "") or "")
+
+def _msg_content(m: Any) -> str:
+    if isinstance(m, dict):
+        return _content_to_str(m.get("content", ""))
+    return _content_to_str(getattr(m, "content", ""))
+
+def _plain_history(history: Any) -> list:
+    """Always return [{role, content:str}, ...] — never Gradio list-blocks."""
+    out = []
+    if not history:
+        return out
+    for m in history:
+        if isinstance(m, (list, tuple)) and len(m) >= 1:
+            u = _content_to_str(m[0]) if m[0] else ""
+            a = _content_to_str(m[1]) if len(m) > 1 and m[1] else ""
+            if u:
+                out.append({"role": "user", "content": u})
+            if a:
+                out.append({"role": "assistant", "content": a})
+            continue
+        role = _msg_role(m)
+        if role not in ("user", "assistant"):
+            continue
+        out.append({"role": role, "content": _msg_content(m)})
+    return out
+
+def _user_text(message: Any) -> str:
+    if isinstance(message, dict):
+        return _content_to_str(message.get("content", "")).strip()
+    return _content_to_str(message).strip()
 
 # ── web search ───────────────────────────────────────────────────────────────
 def web_search(query: str, k: int = 5) -> str:
-    query = (query or "").strip()[:240]
+    query = _content_to_str(query).strip()[:240]
     if not query:
         return "Empty query."
     try:
@@ -116,7 +246,7 @@ def web_search(query: str, k: int = 5) -> str:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
-        rows = list(DDGS().text(query, max_results=k)) or []
+        rows = list(DDGS().text(query, max_results=k, region="wt-wt")) or []
         if not rows:
             return f"No results for: {query}"
         out = []
@@ -133,7 +263,7 @@ SEARCH_RE = re.compile(r"\[WEB_SEARCH:\s*(.+?)\]", re.S)
 NEED_SEARCH_RE = re.compile(
     r"\b(latest|breaking|news|today|current|right now|who won|score|"
     r"price of|weather|release date|as of|what happened|update|yesterday|"
-    r"this week|this year|stock|ceo of)\b",
+    r"this week|this year|stock|ceo of|search (the web|for)|look up|google)\b",
     re.I,
 )
 SYSTEM = (
@@ -151,16 +281,25 @@ def load_history() -> list:
         try:
             data = json.loads(HISTORY_PATH.read_text())
             msgs = data.get("messages", data if isinstance(data, list) else [])
-            return [m for m in msgs if isinstance(m, dict) and "role" in m and "content" in m]
+            return _plain_history(msgs)
         except Exception:
             return []
     return []
 
 def save_history(messages: list) -> None:
-    payload = {"updated": datetime.now(timezone.utc).isoformat(), "model": MODEL_ID, "messages": messages}
+    payload = {
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "model": MODEL_ID,
+        "messages": _plain_history(messages),
+    }
     HISTORY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
 def trim_messages(msgs: list) -> list:
+    msgs = _plain_history(msgs) if msgs and msgs[0].get("role") != "system" else [
+        {"role": m.get("role"), "content": _content_to_str(m.get("content"))}
+        for m in msgs
+        if isinstance(m, dict) and m.get("role") in ("system", "user", "assistant")
+    ]
     sys_m, rest = [], []
     for m in msgs:
         (sys_m if m["role"] == "system" else rest).append(m)
@@ -180,11 +319,11 @@ def trim_messages(msgs: list) -> list:
 
 def _set_last(history: list, content: str) -> list:
     """Replace last bubble (copy) so Gradio sees a new list and re-renders."""
+    content = _content_to_str(content)
     if not history:
         return [{"role": "assistant", "content": content}]
-    last = dict(history[-1])
-    last["content"] = content
-    return history[:-1] + [last]
+    last = {"role": _msg_role(history[-1]) or "assistant", "content": content}
+    return _plain_history(history[:-1]) + [last]
 
 class DualStop(StoppingCriteria):
     def __init__(self, *flags: threading.Event):
@@ -196,6 +335,8 @@ def _generate_stream(messages: list, temperature: float, max_new: int,
                      stop_flag: threading.Event) -> Iterator[str]:
     messages = trim_messages(messages)
     prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if not isinstance(prompt, str):
+        prompt = str(prompt)
     inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=MAX_INPUT_TOKENS)
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
     streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
@@ -219,30 +360,22 @@ def _generate_stream(messages: list, temperature: float, max_new: int,
             for piece in streamer:
                 if stop_flag.is_set():
                     break
-                yield piece
+                yield piece if isinstance(piece, str) else _content_to_str(piece)
         finally:
             cancel.set()
             t.join(timeout=60)
 
-def _user_text(message) -> str:
-    if isinstance(message, dict):
-        c = message.get("content", "")
-        if isinstance(c, list):
-            return " ".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in c)
-        return str(c)
-    return str(message)
-
 # ── agent (history already ends with the new user turn) ──────────────────────
 def agent_stream(history: list, temperature: float, max_new: int,
                  force_search: bool, stop_flag: threading.Event) -> Iterator[list]:
-    history = [dict(m) for m in (history or []) if m.get("role") in ("user", "assistant")]
+    history = _plain_history(history)
     if not history or history[-1]["role"] != "user":
         yield history
         return
     user_msg = history[-1]["content"]
     messages = [{"role": "system", "content": SYSTEM}] + history
 
-    pre = force_search or bool(NEED_SEARCH_RE.search(user_msg))
+    pre = bool(force_search) or bool(NEED_SEARCH_RE.search(user_msg))
     if pre:
         history = history + [{"role": "assistant", "content": f"🔍 Searching: {user_msg[:80]}…"}]
         yield history
@@ -303,12 +436,15 @@ css = """
           border: 1px solid #312e81; }
 footer { visibility: hidden; }
 """
-status_md = (
-    f"**model** `{MODEL_ID}`  ·  **device** `{DEVICE}`  ·  "
-    f"**gpu** {GPU['name']}  ·  **cc** {GPU['cc'] or 'n/a'}  ·  "
-    f"**pascal+** {'yes' if GPU['pascal_plus'] else 'no'}  ·  "
-    f"**cache** `{CACHE_DIR}`"
-)
+
+def status_md(extra: str | None = None) -> str:
+    body = extra or status_line
+    return (
+        f"{body}\n\n"
+        f"**device** `{DEVICE}`  ·  **gpu** {GPU['name']}  ·  **cc** {GPU['cc'] or 'n/a'}  ·  "
+        f"**pascal+** {'yes' if GPU['pascal_plus'] else 'no'}  ·  **cache** `{CACHE_DIR}`"
+    )
+
 theme = gr.themes.Soft(
     primary_hue="indigo", secondary_hue="slate",
     font=[gr.themes.GoogleFont("IBM Plex Sans"), "system-ui", "sans-serif"],
@@ -327,9 +463,9 @@ def make_chatbot():
 with gr.Blocks(theme=theme, css=css, fill_height=True, title="Local Colab Agent") as demo:
     gr.Markdown(
         "### Local Colab Agent\n"
-        "Streaming tokens · web search · disk chat history · Hugging Face cache · Pascal+ GPU path"
+        "Streaming tokens · web search (DuckDuckGo) · disk chat history · Hugging Face cache · Pascal+ GPU path"
     )
-    gr.Markdown(status_md, elem_id="status")
+    status = gr.Markdown(status_md(), elem_id="status")
     chatbot = make_chatbot()
     with gr.Row():
         msg = gr.Textbox(
@@ -338,7 +474,19 @@ with gr.Blocks(theme=theme, css=css, fill_height=True, title="Local Colab Agent"
         )
         send = gr.Button("Send", variant="primary", scale=1)
         stop = gr.Button("Stop", variant="stop", scale=1)
-    with gr.Accordion("Settings", open=False):
+    with gr.Accordion("Settings", open=True):
+        with gr.Row():
+            model_dd = gr.Dropdown(
+                choices=list(MODELS.keys()),
+                value=DEFAULT_MODEL_NAME,
+                label="Model",
+                scale=3,
+            )
+            hf_token = gr.Textbox(
+                label="HF token (only if a model is gated)",
+                type="password", scale=2,
+            )
+            load_btn = gr.Button("Load model", scale=1)
         with gr.Row():
             temperature = gr.Slider(0.0, 1.2, value=0.7, step=0.05, label="Temperature")
             max_new = gr.Slider(64, 2048, value=512, step=64, label="Max new tokens")
@@ -356,18 +504,21 @@ with gr.Blocks(theme=theme, css=css, fill_height=True, title="Local Colab Agent"
     )
 
     def on_chat(message, history, temperature, max_new, force):
-        """Single generator: clear box, append user turn, stream tokens. No .then() race."""
+        """Single generator: clear box, append user turn, stream tokens."""
         STOP.clear()
-        text = _user_text(message).strip()
-        history = history or []
+        text = _user_text(message)
+        history = _plain_history(history)
         if not text:
             yield "", history
+            return
+        if model is None or tok is None:
+            yield "", history + [{"role": "assistant", "content": "No model loaded. Pick one and click Load model."}]
             return
         history = history + [{"role": "user", "content": text}]
         yield "", history
         try:
             for h in agent_stream(history, temperature, max_new, force, STOP):
-                yield "", h
+                yield "", _plain_history(h)
         except Exception:
             err = traceback.format_exc().splitlines()[-1]
             yield "", history + [{"role": "assistant", "content": f"Generation error: {err}"}]
@@ -384,6 +535,16 @@ with gr.Blocks(theme=theme, css=css, fill_height=True, title="Local Colab Agent"
     def on_reload():
         return load_history()
 
+    def on_load_model(name, token):
+        STOP.set()
+        mid = MODELS.get(name, name)
+        try:
+            note = load_llm(mid, token)
+            return status_md(note)
+        except Exception:
+            err = traceback.format_exc().splitlines()[-1]
+            return status_md(f"**Load failed:** `{err}`")
+
     chat_kw = dict(
         fn=on_chat,
         inputs=[msg, chatbot, temperature, max_new, force],
@@ -394,6 +555,7 @@ with gr.Blocks(theme=theme, css=css, fill_height=True, title="Local Colab Agent"
     stop.click(on_stop, cancels=[sub, clk])
     clear.click(on_clear, outputs=chatbot, cancels=[sub, clk])
     reload_h.click(on_reload, outputs=chatbot)
+    load_btn.click(on_load_model, inputs=[model_dd, hf_token], outputs=status, cancels=[sub, clk])
 
 print(f"Gradio {gr.__version__}")
 try:

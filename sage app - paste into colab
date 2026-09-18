@@ -1,0 +1,403 @@
+# ── Local Colab Agent: search + history + cache + Gradio 6 stream ────────────
+# Runtime → Change runtime type → T4/L4/A100. Pascal (CC>=6.0)+ use CUDA; older → CPU.
+!pip install -q -U "gradio>=6.0.0" transformers accelerate bitsandbytes ddgs sentencepiece protobuf
+
+import os, re, json, traceback, threading, warnings
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Iterator
+
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+# ── knobs ────────────────────────────────────────────────────────────────────
+PERSIST_ON_DRIVE  = False   # True → model cache + history on Google Drive
+FORCE_4BIT        = False   # True → 4-bit even on big GPUs (needs CC>=7.5)
+GPU_CC_MIN        = 6       # Pascal = 6.0
+BNB_CC_MIN        = 7.5     # bitsandbytes 4-bit is reliable on Turing+
+MAX_HISTORY_TURNS = 12
+MAX_INPUT_TOKENS  = 3072
+MAX_SEARCH_LOOPS  = 2
+
+# ── cache dirs ───────────────────────────────────────────────────────────────
+if PERSIST_ON_DRIVE:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    CACHE_DIR = Path("/content/drive/MyDrive/colab_agent_cache")
+else:
+    CACHE_DIR = Path("/content/hf_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+HISTORY_PATH = CACHE_DIR / "chat_history.json"
+os.environ["HF_HOME"] = str(CACHE_DIR)
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR)
+
+import torch
+import gradio as gr
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer,
+    BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList,
+)
+
+# ── GPU detection (Pascal and above) ─────────────────────────────────────────
+def detect_gpu() -> dict:
+    info = dict(cuda=torch.cuda.is_available(), name="CPU", cc=None, cc_float=0.0,
+                major=0, vram_gb=0.0, pascal_plus=False, use_gpu=False,
+                use_4bit=False, note="")
+    if not info["cuda"]:
+        info["note"] = "No CUDA. Runtime → Change runtime type → T4 GPU."
+        return info
+    p = torch.cuda.get_device_properties(0)
+    major, minor = torch.cuda.get_device_capability(0)
+    cc_float = major + minor / 10
+    info.update(name=torch.cuda.get_device_name(0), cc=f"{major}.{minor}",
+                cc_float=cc_float, major=major,
+                vram_gb=round(p.total_memory / 1024**3, 2),
+                pascal_plus=major >= GPU_CC_MIN)
+    if not info["pascal_plus"]:
+        info["note"] = f"GPU CC {info['cc']} < Pascal (6.0) → CPU fallback."
+        return info
+    info["use_gpu"] = True
+    info["use_4bit"] = (FORCE_4BIT or info["vram_gb"] < 8) and cc_float >= BNB_CC_MIN
+    extra = "4-bit" if info["use_4bit"] else "fp16"
+    info["note"] = f"{info['name']}  |  CC {info['cc']} (Pascal+)  |  {info['vram_gb']} GB  |  {extra}"
+    return info
+
+GPU = detect_gpu()
+print("GPU:", GPU["note"])
+MODEL_ID = "Qwen/Qwen2.5-3B-Instruct" if GPU["use_gpu"] else "Qwen/Qwen2.5-1.5B-Instruct"
+
+# ── model load (cached) ──────────────────────────────────────────────────────
+print(f"Loading {MODEL_ID}  cache={CACHE_DIR}")
+tok = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_DIR, trust_remote_code=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+tok.padding_side = "left"
+
+load_kw = dict(cache_dir=CACHE_DIR, trust_remote_code=True, low_cpu_mem_usage=True)
+if GPU["use_gpu"]:
+    load_kw["attn_implementation"] = "sdpa"  # flash-attn2 needs Ampere+; Pascal/Turing → SDPA
+    if GPU["use_4bit"]:
+        load_kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        load_kw["torch_dtype"] = torch.float16
+    load_kw["device_map"] = "auto"
+else:
+    load_kw["torch_dtype"] = torch.float32
+    load_kw["device_map"] = "cpu"
+
+try:
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **load_kw)
+except Exception as e:
+    if "quantization_config" not in load_kw:
+        raise
+    print(f"4-bit load failed ({type(e).__name__}: {e}) → fp16 fallback")
+    load_kw.pop("quantization_config", None)
+    load_kw["torch_dtype"] = torch.float16
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **load_kw)
+
+model.eval()
+DEVICE = next(model.parameters()).device
+GEN_LOCK = threading.Lock()
+print(f"Ready on {DEVICE}  params={sum(p.numel() for p in model.parameters())/1e6:.0f}M")
+
+# ── web search ───────────────────────────────────────────────────────────────
+def web_search(query: str, k: int = 5) -> str:
+    query = (query or "").strip()[:240]
+    if not query:
+        return "Empty query."
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        rows = list(DDGS().text(query, max_results=k)) or []
+        if not rows:
+            return f"No results for: {query}"
+        out = []
+        for i, r in enumerate(rows, 1):
+            title = r.get("title") or ""
+            url = r.get("href") or r.get("url") or ""
+            body = (r.get("body") or r.get("snippet") or "")[:400]
+            out.append(f"{i}. {title}\n   {url}\n   {body}")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Search failed: {type(e).__name__}: {e}"
+
+SEARCH_RE = re.compile(r"\[WEB_SEARCH:\s*(.+?)\]", re.S)
+NEED_SEARCH_RE = re.compile(
+    r"\b(latest|breaking|news|today|current|right now|who won|score|"
+    r"price of|weather|release date|as of|what happened|update|yesterday|"
+    r"this week|this year|stock|ceo of)\b",
+    re.I,
+)
+SYSTEM = (
+    "You are a precise local AI agent running in Google Colab. "
+    "You may search the web for facts, news, and anything you are unsure about.\n"
+    "To search, output this tag on its own line and nothing after it:\n"
+    "[WEB_SEARCH: short query]\n"
+    "After results arrive, answer using them. Cite titles/URLs briefly. "
+    "Never invent URLs or numbers. Be concise unless asked to go deep."
+)
+
+# ── history on disk ──────────────────────────────────────────────────────────
+def load_history() -> list:
+    if HISTORY_PATH.exists():
+        try:
+            data = json.loads(HISTORY_PATH.read_text())
+            msgs = data.get("messages", data if isinstance(data, list) else [])
+            return [m for m in msgs if isinstance(m, dict) and "role" in m and "content" in m]
+        except Exception:
+            return []
+    return []
+
+def save_history(messages: list) -> None:
+    payload = {"updated": datetime.now(timezone.utc).isoformat(), "model": MODEL_ID, "messages": messages}
+    HISTORY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+def trim_messages(msgs: list) -> list:
+    sys_m, rest = [], []
+    for m in msgs:
+        (sys_m if m["role"] == "system" else rest).append(m)
+    rest = rest[-(MAX_HISTORY_TURNS * 2):]
+    kept = (sys_m[:1] or [{"role": "system", "content": SYSTEM}]) + rest
+    while len(kept) > 2:
+        ids = tok.apply_chat_template(kept, tokenize=True, add_generation_prompt=True)
+        if len(ids) <= MAX_INPUT_TOKENS:
+            break
+        for i, m in enumerate(kept):
+            if m["role"] != "system":
+                kept.pop(i)
+                break
+        else:
+            break
+    return kept
+
+def _set_last(history: list, content: str) -> list:
+    """Replace last bubble (copy) so Gradio sees a new list and re-renders."""
+    if not history:
+        return [{"role": "assistant", "content": content}]
+    last = dict(history[-1])
+    last["content"] = content
+    return history[:-1] + [last]
+
+class DualStop(StoppingCriteria):
+    def __init__(self, *flags: threading.Event):
+        self.flags = flags
+    def __call__(self, input_ids, scores, **kwargs):
+        return any(f.is_set() for f in self.flags)
+
+def _generate_stream(messages: list, temperature: float, max_new: int,
+                     stop_flag: threading.Event) -> Iterator[str]:
+    messages = trim_messages(messages)
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=MAX_INPUT_TOKENS)
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+    cancel = threading.Event()
+    kwargs = dict(
+        **inputs,
+        streamer=streamer,
+        max_new_tokens=int(max_new),
+        do_sample=temperature > 0.05,
+        temperature=max(float(temperature), 0.05),
+        top_p=0.9,
+        repetition_penalty=1.08,
+        pad_token_id=tok.pad_token_id,
+        eos_token_id=tok.eos_token_id,
+        stopping_criteria=StoppingCriteriaList([DualStop(stop_flag, cancel)]),
+    )
+    with GEN_LOCK:
+        t = threading.Thread(target=model.generate, kwargs=kwargs, daemon=True)
+        t.start()
+        try:
+            for piece in streamer:
+                if stop_flag.is_set():
+                    break
+                yield piece
+        finally:
+            cancel.set()
+            t.join(timeout=60)
+
+def _user_text(message) -> str:
+    if isinstance(message, dict):
+        c = message.get("content", "")
+        if isinstance(c, list):
+            return " ".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in c)
+        return str(c)
+    return str(message)
+
+# ── agent (history already ends with the new user turn) ──────────────────────
+def agent_stream(history: list, temperature: float, max_new: int,
+                 force_search: bool, stop_flag: threading.Event) -> Iterator[list]:
+    history = [dict(m) for m in (history or []) if m.get("role") in ("user", "assistant")]
+    if not history or history[-1]["role"] != "user":
+        yield history
+        return
+    user_msg = history[-1]["content"]
+    messages = [{"role": "system", "content": SYSTEM}] + history
+
+    pre = force_search or bool(NEED_SEARCH_RE.search(user_msg))
+    if pre:
+        history = history + [{"role": "assistant", "content": f"🔍 Searching: {user_msg[:80]}…"}]
+        yield history
+        results = web_search(user_msg)
+        messages.append({
+            "role": "user",
+            "content": f"Web search results:\n{results}\n\nAnswer the user now. Do not search again unless necessary.",
+        })
+        history = _set_last(history, "")
+        yield history
+    else:
+        history = history + [{"role": "assistant", "content": ""}]
+        yield history
+
+    loops = 0
+    while loops <= MAX_SEARCH_LOOPS and not stop_flag.is_set():
+        acc, hit = "", None
+        for piece in _generate_stream(messages, temperature, max_new, stop_flag):
+            acc += piece
+            m = SEARCH_RE.search(acc)
+            if m:
+                hit = m.group(1).strip()
+                acc = acc[:m.start()].rstrip()
+                break
+            history = _set_last(history, acc)
+            yield history
+        history = _set_last(history, acc)
+        yield history
+        if not hit or loops >= MAX_SEARCH_LOOPS:
+            break
+        loops += 1
+        history = _set_last(history, (acc + f"\n🔍 Searching: {hit}…").strip())
+        yield history
+        results = web_search(hit)
+        messages.append({"role": "assistant", "content": f"[WEB_SEARCH: {hit}]"})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Web search results for '{hit}':\n{results}\n\n"
+                "Now answer the original question. Do not emit another search tag unless essential."
+            ),
+        })
+        if acc:
+            history = history + [{"role": "assistant", "content": ""}]
+        else:
+            history = _set_last(history, "")
+        yield history
+
+    save_history(history)
+    yield history
+
+# ── Gradio 6 UI ──────────────────────────────────────────────────────────────
+STOP = threading.Event()
+css = """
+.gradio-container { max-width: 880px !important; }
+#status { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+          padding: 10px 12px; border-radius: 10px; background: #0b1020; color: #c7d2fe;
+          border: 1px solid #312e81; }
+footer { visibility: hidden; }
+"""
+status_md = (
+    f"**model** `{MODEL_ID}`  ·  **device** `{DEVICE}`  ·  "
+    f"**gpu** {GPU['name']}  ·  **cc** {GPU['cc'] or 'n/a'}  ·  "
+    f"**pascal+** {'yes' if GPU['pascal_plus'] else 'no'}  ·  "
+    f"**cache** `{CACHE_DIR}`"
+)
+theme = gr.themes.Soft(
+    primary_hue="indigo", secondary_hue="slate",
+    font=[gr.themes.GoogleFont("IBM Plex Sans"), "system-ui", "sans-serif"],
+)
+
+def make_chatbot():
+    kw = dict(value=load_history(), height=560, label="Chat")
+    for extra in (dict(type="messages", show_copy_button=True),
+                  dict(show_copy_button=True), {}):
+        try:
+            return gr.Chatbot(**kw, **extra)
+        except TypeError:
+            continue
+    return gr.Chatbot(**kw)
+
+with gr.Blocks(theme=theme, css=css, fill_height=True, title="Local Colab Agent") as demo:
+    gr.Markdown(
+        "### Local Colab Agent\n"
+        "Streaming tokens · web search · disk chat history · Hugging Face cache · Pascal+ GPU path"
+    )
+    gr.Markdown(status_md, elem_id="status")
+    chatbot = make_chatbot()
+    with gr.Row():
+        msg = gr.Textbox(
+            placeholder="Ask anything…  (Shift+Enter for newline)",
+            scale=5, show_label=False, autofocus=True, lines=1,
+        )
+        send = gr.Button("Send", variant="primary", scale=1)
+        stop = gr.Button("Stop", variant="stop", scale=1)
+    with gr.Accordion("Settings", open=False):
+        with gr.Row():
+            temperature = gr.Slider(0.0, 1.2, value=0.7, step=0.05, label="Temperature")
+            max_new = gr.Slider(64, 2048, value=512, step=64, label="Max new tokens")
+        force = gr.Checkbox(False, label="Force web search on every turn")
+        with gr.Row():
+            clear = gr.Button("Clear history")
+            reload_h = gr.Button("Reload saved history")
+    gr.Examples(
+        examples=[
+            "What is NVIDIA Pascal vs Ampere compute capability?",
+            "Latest stable Python version and release date",
+            "Summarize what an AI agent is, then search for a notable 2024 agent paper",
+        ],
+        inputs=msg,
+    )
+
+    def on_chat(message, history, temperature, max_new, force):
+        """Single generator: clear box, append user turn, stream tokens. No .then() race."""
+        STOP.clear()
+        text = _user_text(message).strip()
+        history = history or []
+        if not text:
+            yield "", history
+            return
+        history = history + [{"role": "user", "content": text}]
+        yield "", history
+        try:
+            for h in agent_stream(history, temperature, max_new, force, STOP):
+                yield "", h
+        except Exception:
+            err = traceback.format_exc().splitlines()[-1]
+            yield "", history + [{"role": "assistant", "content": f"Generation error: {err}"}]
+
+    def on_stop():
+        STOP.set()
+        return gr.update()
+
+    def on_clear():
+        STOP.set()
+        save_history([])
+        return []
+
+    def on_reload():
+        return load_history()
+
+    chat_kw = dict(
+        fn=on_chat,
+        inputs=[msg, chatbot, temperature, max_new, force],
+        outputs=[msg, chatbot],
+    )
+    sub = msg.submit(**chat_kw)
+    clk = send.click(**chat_kw)
+    stop.click(on_stop, cancels=[sub, clk])
+    clear.click(on_clear, outputs=chatbot, cancels=[sub, clk])
+    reload_h.click(on_reload, outputs=chatbot)
+
+print(f"Gradio {gr.__version__}")
+try:
+    demo.queue(default_concurrency_limit=1)
+except TypeError:
+    demo.queue()
+demo.launch(share=True, show_error=True)

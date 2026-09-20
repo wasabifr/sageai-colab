@@ -73,7 +73,7 @@ MODELS = {
     "Qwen2.5 Coder 7B":      "Qwen/Qwen2.5-Coder-7B-Instruct",
     "SmolLM2 1.7B Instruct": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
 }
-DEFAULT_MODEL_NAME = "Qwen2.5-3B-Instruct" if GPU["use_gpu"] else "Qwen2.5-1.5B-Instruct"
+DEFAULT_MODEL_NAME = "Qwen 3 8B" if GPU["use_gpu"] else "SmolLM2 1.7B Instruct"
 MODEL_ID = MODELS[DEFAULT_MODEL_NAME]
 
 FALLBACK_CHAT_TEMPLATE = (
